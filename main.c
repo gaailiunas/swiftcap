@@ -314,6 +314,7 @@ void *worker_thread(void *arg)
             if (prev_leftover_len > 0) {
                 memcpy(prev_leftover, slot->leftover_buf, prev_leftover_len);
             }
+            slot->ready = false;
             pthread_mutex_unlock(&slot->mtx);
         }
 
@@ -328,19 +329,28 @@ void *worker_thread(void *arg)
                     memcpy(&hdr, prev_leftover, hdr_size);
                 }
                 else {
+                    size_t needed = hdr_size - prev_leftover_len;
+                    if (job->len < needed) {
+                        break;
+                    }
                     memcpy(&hdr, prev_leftover, prev_leftover_len);
                     memcpy((uint8_t *)&hdr + prev_leftover_len, job->buffer,
                         hdr_size - prev_leftover_len);
                 }
 
                 size_t total_pkt_len = hdr_size + hdr.incl_len;
-                chunk_read_offset = total_pkt_len - prev_leftover_len;
-                // process
-                processed_packets++;
-                uint64_t global_hdr_offset =
-                    job->global_base_offset - prev_leftover_len;
-                async_writer_push(
-                    &g_writer, processed_packets, global_hdr_offset);
+                if (total_pkt_len >= prev_leftover_len) {
+                    chunk_read_offset = total_pkt_len - prev_leftover_len;
+                    if (chunk_read_offset > job->len) {
+                        chunk_read_offset = job->len;
+                    }
+                    // process
+                    processed_packets++;
+                    uint64_t global_hdr_offset =
+                        job->global_base_offset - prev_leftover_len;
+                    async_writer_push(
+                        &g_writer, processed_packets, global_hdr_offset);
+                }
             }
             else {
                 PcapngBlockHeader block;
