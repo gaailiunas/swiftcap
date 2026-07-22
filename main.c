@@ -62,6 +62,109 @@ typedef struct {
 #pragma pack(pop)
 
 typedef struct {
+    uint64_t packet_number;
+    uint64_t header_offset;
+} PacketRecord;
+
+#define WRITER_QUEUE_CAPACITY (1024 * 1024)
+#define WRITER_BATCH_SIZE 4096
+
+typedef struct {
+    PacketRecord ring[WRITER_QUEUE_CAPACITY];
+    size_t head;
+    size_t tail;
+    size_t count;
+    pthread_mutex_t mtx;
+    pthread_cond_t cv_not_empty;
+    pthread_cond_t cv_not_full;
+    bool done;
+    int fd;
+} AsyncWriter;
+
+static AsyncWriter g_writer;
+
+void async_writer_init(AsyncWriter *w, int output_fd)
+{
+    w->head = 0;
+    w->tail = 0;
+    w->count = 0;
+    w->done = false;
+    w->fd = output_fd;
+    pthread_mutex_init(&w->mtx, NULL);
+    pthread_cond_init(&w->cv_not_empty, NULL);
+    pthread_cond_init(&w->cv_not_full, NULL);
+}
+
+void async_writer_destroy(AsyncWriter *w)
+{
+    pthread_mutex_destroy(&w->mtx);
+    pthread_cond_destroy(&w->cv_not_empty);
+    pthread_cond_destroy(&w->cv_not_full);
+}
+
+void async_writer_push(AsyncWriter *w, uint64_t pkt_num, uint64_t offset)
+{
+    pthread_mutex_lock(&w->mtx);
+    while (w->count == WRITER_QUEUE_CAPACITY) {
+        pthread_cond_wait(&w->cv_not_full, &w->mtx);
+    }
+
+    w->ring[w->tail].packet_number = pkt_num;
+    w->ring[w->tail].header_offset = offset;
+    w->tail = (w->tail + 1) % WRITER_QUEUE_CAPACITY;
+    w->count++;
+
+    pthread_cond_signal(&w->cv_not_empty);
+    pthread_mutex_unlock(&w->mtx);
+}
+
+void async_writer_set_done(AsyncWriter *w)
+{
+    pthread_mutex_lock(&w->mtx);
+    w->done = true;
+    pthread_cond_broadcast(&w->cv_not_empty);
+    pthread_mutex_unlock(&w->mtx);
+}
+
+void *writer_worker(void *arg)
+{
+    AsyncWriter *w = (AsyncWriter *)arg;
+    PacketRecord local_batch[WRITER_BATCH_SIZE];
+    size_t batch_count = 0;
+
+    while (true) {
+        pthread_mutex_lock(&w->mtx);
+
+        while (w->count == 0 && !w->done) {
+            pthread_cond_wait(&w->cv_not_empty, &w->mtx);
+        }
+
+        if (w->count == 0 && w->done) {
+            pthread_mutex_unlock(&w->mtx);
+            break;
+        }
+
+        while (w->count > 0 && batch_count < WRITER_BATCH_SIZE) {
+            local_batch[batch_count++] = w->ring[w->head];
+            w->head = (w->head + 1) % WRITER_QUEUE_CAPACITY;
+            w->count--;
+        }
+
+        pthread_cond_signal(&w->cv_not_full);
+        pthread_mutex_unlock(&w->mtx);
+
+        if (batch_count > 0) {
+            ssize_t written =
+                write(w->fd, local_batch, batch_count * sizeof(PacketRecord));
+            (void)written;
+            batch_count = 0;
+        }
+    }
+
+    return NULL;
+}
+
+typedef struct {
     pthread_mutex_t mtx;
     pthread_cond_t cond;
     bool ready;
@@ -209,9 +312,6 @@ void *worker_thread(void *arg)
             }
             prev_leftover_len = slot->leftover_len;
             if (prev_leftover_len > 0) {
-                printf("restoring previous leftover bytes from job #%lu to job "
-                       "#%lu\n",
-                    id - 1, id);
                 memcpy(prev_leftover, slot->leftover_buf, prev_leftover_len);
             }
             pthread_mutex_unlock(&slot->mtx);
@@ -237,6 +337,10 @@ void *worker_thread(void *arg)
                 chunk_read_offset = total_pkt_len - prev_leftover_len;
                 // process
                 processed_packets++;
+                uint64_t global_hdr_offset =
+                    job->global_base_offset - prev_leftover_len;
+                async_writer_push(
+                    &g_writer, processed_packets, global_hdr_offset);
             }
             else {
                 PcapngBlockHeader block;
@@ -257,6 +361,10 @@ void *worker_thread(void *arg)
                     block.block_type == PCAPNG_SPB) {
                     // process
                     processed_packets++;
+                    uint64_t global_hdr_offset =
+                        job->global_base_offset - prev_leftover_len;
+                    async_writer_push(
+                        &g_writer, processed_packets, global_hdr_offset);
                 }
             }
         }
@@ -276,6 +384,11 @@ void *worker_thread(void *arg)
                     break;
 
                 processed_packets++;
+                uint64_t global_hdr_offset =
+                    job->global_base_offset + local_offset;
+                async_writer_push(
+                    &g_writer, processed_packets, global_hdr_offset);
+
                 local_offset += pkt_len;
             }
         }
@@ -295,13 +408,15 @@ void *worker_thread(void *arg)
                 if (block->block_type == PCAPNG_EPB ||
                     block->block_type == PCAPNG_SPB) {
                     processed_packets++;
+                    uint64_t global_hdr_offset =
+                        job->global_base_offset + local_offset;
+                    async_writer_push(
+                        &g_writer, processed_packets, global_hdr_offset);
                 }
 
                 local_offset += block->block_total_length;
             }
         }
-
-        printf("processed packets: %lu\n", processed_packets);
 
         // handover leftover bytes for the next job
         size_t trailing_leftover = job->len - local_offset;
@@ -309,7 +424,6 @@ void *worker_thread(void *arg)
 
         pthread_mutex_lock(&my_slot->mtx);
         if (trailing_leftover > 0) {
-            printf("storing leftover bytes from job #%lu\n", id);
             memcpy(my_slot->leftover_buf, job->buffer + local_offset,
                 trailing_leftover);
         }
@@ -330,11 +444,18 @@ void *worker_thread(void *arg)
     return NULL;
 }
 
-int parse_pcap(const char *filename, int cores)
+int parse_pcap(const char *filename, const char *output_binary, int cores)
 {
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
-        perror("Failed to open file");
+        perror("Failed to open input file");
+        return 1;
+    }
+
+    int out_fd = open(output_binary, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out_fd < 0) {
+        perror("Failed to open output binary file");
+        close(fd);
         return 1;
     }
 
@@ -343,18 +464,21 @@ int parse_pcap(const char *filename, int cores)
     size_t filesize = sb.st_size;
     if (filesize < sizeof(PcapGlobalHeader)) {
         close(fd);
+        close(out_fd);
         return 1;
     }
 
     uint32_t magic;
     if (read(fd, &magic, sizeof(magic)) != sizeof(magic)) {
         close(fd);
+        close(out_fd);
         return 1;
     }
     PcapFormat format = get_format(magic);
     if (format == UNKNOWN) {
         fprintf(stderr, "Unknown format magic: 0x%X\n", magic);
         close(fd);
+        close(out_fd);
         return 1;
     }
 
@@ -363,6 +487,10 @@ int parse_pcap(const char *filename, int cores)
         num_cores = 4;
 
     handoff_table_init();
+    async_writer_init(&g_writer, out_fd);
+
+    pthread_t writer_thread;
+    pthread_create(&writer_thread, NULL, writer_worker, &g_writer);
 
     JobQueue *job_queue = malloc(sizeof(JobQueue));
     queue_init(job_queue);
@@ -394,7 +522,6 @@ int parse_pcap(const char *filename, int cores)
             break;
         }
 
-        printf("pushing job #%lu\n", job_counter);
         ChunkJob *job = malloc(sizeof(ChunkJob));
         assert(job != NULL);
         job->job_id = job_counter++;
@@ -413,23 +540,31 @@ int parse_pcap(const char *filename, int cores)
         pthread_join(thread_pool[i], NULL);
     }
 
+    async_writer_set_done(&g_writer);
+    pthread_join(writer_thread, NULL);
+
     printf("All streaming jobs complete cleanly.\n");
-    printf("total packets processed: %lu\n", g_total_packets);
+    printf("Total packets processed and written: %lu\n",
+        atomic_load(&g_total_packets));
 
     free(thread_pool);
     queue_destroy(job_queue);
     free(job_queue);
     handoff_table_destroy();
+    async_writer_destroy(&g_writer);
     close(fd);
+    close(out_fd);
     return 0;
 }
 
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <path_to_pcap>\n", argv[0]);
+        fprintf(
+            stderr, "Usage: %s <path_to_pcap> [output_binary_path]\n", argv[0]);
         return 1;
     }
 
-    return parse_pcap(argv[1], -1);
+    const char *out_path = (argc >= 3) ? argv[2] : "index_output.bin";
+    return parse_pcap(argv[1], out_path, -1);
 }
