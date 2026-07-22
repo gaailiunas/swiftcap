@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -68,6 +69,7 @@ typedef struct {
     size_t leftover_len;
 } HandoffSlot;
 
+static atomic_uint_fast64_t g_total_packets = 0;
 static HandoffSlot g_handoff_table[QUEUE_CAPACITY];
 
 void handoff_table_init(void)
@@ -300,7 +302,7 @@ void *worker_thread(void *arg)
         }
 
         printf("processed packets: %lu\n", processed_packets);
-        
+
         // handover leftover bytes for the next job
         size_t trailing_leftover = job->len - local_offset;
         HandoffSlot *my_slot = &g_handoff_table[id % QUEUE_CAPACITY];
@@ -320,6 +322,8 @@ void *worker_thread(void *arg)
         free(job);
     }
 
+    atomic_fetch_add_explicit(
+        &g_total_packets, processed_packets, memory_order_relaxed);
     printf("Worker Thread #%d finished. Packets counted: %lu\n", args->id,
         processed_packets);
     free(args);
@@ -378,8 +382,8 @@ int parse_pcap(const char *filename, int cores)
     uint64_t job_counter = 0;
 
     while (file_position < filesize) {
-        uint8_t *chunk_buf = NULL;
-        if (posix_memalign((void **)&chunk_buf, ALIGNMENT, CHUNK_SIZE) != 0) {
+        uint8_t *chunk_buf = aligned_alloc(ALIGNMENT, CHUNK_SIZE);
+        if (chunk_buf == NULL) {
             fprintf(stderr, "Allocation failed.\n");
             break;
         }
@@ -410,6 +414,7 @@ int parse_pcap(const char *filename, int cores)
     }
 
     printf("All streaming jobs complete cleanly.\n");
+    printf("total packets processed: %lu\n", g_total_packets);
 
     free(thread_pool);
     queue_destroy(job_queue);
