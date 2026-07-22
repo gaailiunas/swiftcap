@@ -102,17 +102,22 @@ void async_writer_destroy(AsyncWriter *w)
     pthread_cond_destroy(&w->cv_not_full);
 }
 
-void async_writer_push(AsyncWriter *w, uint64_t pkt_num, uint64_t offset)
+void async_writer_push_batch(
+    AsyncWriter *w, const PacketRecord *records, size_t num_records)
 {
+    if (num_records == 0)
+        return;
+
     pthread_mutex_lock(&w->mtx);
-    while (w->count == WRITER_QUEUE_CAPACITY) {
+    while (w->count + num_records > WRITER_QUEUE_CAPACITY) {
         pthread_cond_wait(&w->cv_not_full, &w->mtx);
     }
 
-    w->ring[w->tail].packet_number = pkt_num;
-    w->ring[w->tail].header_offset = offset;
-    w->tail = (w->tail + 1) % WRITER_QUEUE_CAPACITY;
-    w->count++;
+    for (size_t i = 0; i < num_records; i++) {
+        w->ring[w->tail] = records[i];
+        w->tail = (w->tail + 1) % WRITER_QUEUE_CAPACITY;
+    }
+    w->count += num_records;
 
     pthread_cond_signal(&w->cv_not_empty);
     pthread_mutex_unlock(&w->mtx);
@@ -292,11 +297,27 @@ typedef struct {
     JobQueue *job_queue;
 } WorkerArgs;
 
+static inline void record_packet(AsyncWriter *w, PacketRecord *batch,
+    size_t *batch_cnt, uint64_t pkt, uint64_t off)
+{
+    batch[*batch_cnt].packet_number = pkt;
+    batch[*batch_cnt].header_offset = off;
+    (*batch_cnt)++;
+
+    if (*batch_cnt == WRITER_BATCH_SIZE) {
+        async_writer_push_batch(w, batch, *batch_cnt);
+        *batch_cnt = 0;
+    }
+}
+
 void *worker_thread(void *arg)
 {
     WorkerArgs *args = (WorkerArgs *)arg;
     ChunkJob *job = NULL;
     uint64_t processed_packets = 0;
+
+    PacketRecord local_writer_batch[WRITER_BATCH_SIZE];
+    size_t local_writer_count = 0;
 
     while (queue_pop(args->job_queue, &job)) {
         PcapFormat fmt = job->format;
@@ -344,12 +365,13 @@ void *worker_thread(void *arg)
                     if (chunk_read_offset > job->len) {
                         chunk_read_offset = job->len;
                     }
-                    // process
                     processed_packets++;
                     uint64_t global_hdr_offset =
                         job->global_base_offset - prev_leftover_len;
-                    async_writer_push(
-                        &g_writer, processed_packets, global_hdr_offset);
+
+                    record_packet(&g_writer, local_writer_batch,
+                        &local_writer_count, processed_packets,
+                        global_hdr_offset);
                 }
             }
             else {
@@ -369,12 +391,13 @@ void *worker_thread(void *arg)
                     block.block_total_length - prev_leftover_len;
                 if (block.block_type == PCAPNG_EPB ||
                     block.block_type == PCAPNG_SPB) {
-                    // process
                     processed_packets++;
                     uint64_t global_hdr_offset =
                         job->global_base_offset - prev_leftover_len;
-                    async_writer_push(
-                        &g_writer, processed_packets, global_hdr_offset);
+
+                    record_packet(&g_writer, local_writer_batch,
+                        &local_writer_count, processed_packets,
+                        global_hdr_offset);
                 }
             }
         }
@@ -396,8 +419,9 @@ void *worker_thread(void *arg)
                 processed_packets++;
                 uint64_t global_hdr_offset =
                     job->global_base_offset + local_offset;
-                async_writer_push(
-                    &g_writer, processed_packets, global_hdr_offset);
+
+                record_packet(&g_writer, local_writer_batch,
+                    &local_writer_count, processed_packets, global_hdr_offset);
 
                 local_offset += pkt_len;
             }
@@ -420,8 +444,10 @@ void *worker_thread(void *arg)
                     processed_packets++;
                     uint64_t global_hdr_offset =
                         job->global_base_offset + local_offset;
-                    async_writer_push(
-                        &g_writer, processed_packets, global_hdr_offset);
+
+                    record_packet(&g_writer, local_writer_batch,
+                        &local_writer_count, processed_packets,
+                        global_hdr_offset);
                 }
 
                 local_offset += block->block_total_length;
@@ -444,6 +470,11 @@ void *worker_thread(void *arg)
 
         free(job->buffer);
         free(job);
+    }
+
+    if (local_writer_count > 0) {
+        async_writer_push_batch(
+            &g_writer, local_writer_batch, local_writer_count);
     }
 
     atomic_fetch_add_explicit(

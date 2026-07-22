@@ -1,3 +1,4 @@
 *.pcap
 build/
 .cache/
+*.bin
