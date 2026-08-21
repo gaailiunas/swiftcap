@@ -7,23 +7,36 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/*
+TODO: handle endianness properly, implement a dynamic list for interfaces, write
+interfaces to the index file at the beginning as metadata
+*/
+
+typedef enum {
+    ENDIAN_UNKNOWN,
+    ENDIAN_LITTLE,
+    ENDIAN_BIG,
+} EndianType;
+
+typedef enum {
+    TIMESTAMP_UNKNOWN,
+    TIMESTAMP_MICROSECONDS,
+    TIMESTAMP_NANOSECONDS,
+} TimestampFormat;
+
 typedef enum {
     UNKNOWN,
-    PCAP_FORMAT_LE_MS,
-    PCAP_FORMAT_BE_MS,
-    PCAP_FORMAT_LE_NS,
-    PCAP_FORMAT_BE_NS,
+    PCAP,
     PCAPNG,
-} PcapFormat;
-
-#define PCAP_LE_MS_MAGIC 0xd4c3b2a1
-#define PCAP_BE_MS_MAGIC 0xa1b2c3d4
-#define PCAP_LE_NS_MAGIC 0x4d3cb2a1
-#define PCAP_BE_NS_MAGIC 0xa1b23c4d
-#define PCAPNG_MAGIC 0x0a0d0d0a
+} PcapType;
 
 #define PCAPNG_EPB 0x00000006
 #define PCAPNG_SPB 0x00000003
+#define PCAPNG_SHB 0x0A0D0D0A
+#define PCAPNG_IDB 0x00000001
+
+#define OPT_ENDOFOPT 0
+#define IF_TSRESOL_OPT 9
 
 #define ALIGNMENT 4096
 #define CHUNK_SIZE (128 * 1024 * 1024)
@@ -54,59 +67,174 @@ typedef struct {
     uint32_t block_total_length;
 } PcapngBlockHeader;
 
+typedef struct {
+    uint32_t block_type;
+    uint32_t block_total_length;
+    uint32_t byteorder_magic;
+    uint16_t version_major;
+    uint16_t version_minor;
+} PcapngSHB;
+
+typedef struct {
+    uint32_t block_type;
+    uint32_t block_total_length;
+    uint32_t interface_id;
+    uint32_t timestamp_high;
+    uint32_t timestamp_low;
+} PcapngEPB;
+
+typedef struct {
+    uint32_t block_type;
+    uint32_t block_total_length;
+    uint16_t linktype;
+    uint16_t reserved;
+    uint32_t snaplen;
+} PcapngIDB;
+
+typedef struct {
+    uint8_t resol;
+    uint16_t linktype;
+} Interface;
+
+typedef struct {
+    uint16_t option_code;
+    uint16_t option_length;
+} PcapngOptionHeader;
+
 #pragma pack(pop)
 
 typedef struct {
-    uint64_t packet_number;
     uint64_t header_offset;
+    uint64_t timestamp_ns; // 0xffffffffffffffff if unknown
 } PacketRecord;
 
-PcapFormat get_format(uint32_t magic)
+static const uint8_t MAGIC_LE_MS[4] = {
+    0xd4, 0xc3, 0xb2, 0xa1}; /* microsecond, file written LE */
+static const uint8_t MAGIC_BE_MS[4] = {
+    0xa1, 0xb2, 0xc3, 0xd4}; /* microsecond, file written BE */
+static const uint8_t MAGIC_LE_NS[4] = {
+    0x4d, 0x3c, 0xb2, 0xa1}; /* nanosecond,  file written LE */
+static const uint8_t MAGIC_BE_NS[4] = {
+    0xa1, 0xb2, 0x3c, 0x4d}; /* nanosecond,  file written BE */
+static const uint8_t MAGIC_PCAPNG[4] = {
+    0x0a, 0x0d, 0x0d, 0x0a}; /* palindromic, order-independent */
+
+static const uint8_t NG_BYTEORDER_MAGIC_BE[4] = {0x1a, 0x2b, 0x3c, 0x4d};
+static const uint8_t NG_BYTEORDER_MAGIC_LE[4] = {0x4d, 0x3c, 0x2b, 0x1a};
+
+PcapType get_type(const uint8_t magic_bytes[4], EndianType *endian,
+    TimestampFormat *timestamp_format)
 {
-    switch (magic) {
-    case PCAP_LE_MS_MAGIC:
-        return PCAP_FORMAT_LE_MS;
-    case PCAP_BE_MS_MAGIC:
-        return PCAP_FORMAT_BE_MS;
-    case PCAP_LE_NS_MAGIC:
-        return PCAP_FORMAT_LE_NS;
-    case PCAP_BE_NS_MAGIC:
-        return PCAP_FORMAT_BE_NS;
-    case PCAPNG_MAGIC:
-        return PCAPNG;
-    default:
-        return UNKNOWN;
+    if (memcmp(magic_bytes, MAGIC_LE_MS, 4) == 0) {
+        *endian = ENDIAN_LITTLE;
+        *timestamp_format = TIMESTAMP_MICROSECONDS;
+        return PCAP;
     }
+    if (memcmp(magic_bytes, MAGIC_BE_MS, 4) == 0) {
+        *endian = ENDIAN_BIG;
+        *timestamp_format = TIMESTAMP_MICROSECONDS;
+        return PCAP;
+    }
+    if (memcmp(magic_bytes, MAGIC_LE_NS, 4) == 0) {
+        *endian = ENDIAN_LITTLE;
+        *timestamp_format = TIMESTAMP_NANOSECONDS;
+        return PCAP;
+    }
+    if (memcmp(magic_bytes, MAGIC_BE_NS, 4) == 0) {
+        *endian = ENDIAN_BIG;
+        *timestamp_format = TIMESTAMP_NANOSECONDS;
+        return PCAP;
+    }
+    if (memcmp(magic_bytes, MAGIC_PCAPNG, 4) == 0) {
+        return PCAPNG;
+    }
+    return UNKNOWN;
 }
 
-static inline void record_packet(int out_fd, PacketRecord *batch,
-    size_t *batch_cnt, uint64_t pkt, uint64_t off)
+/* ticks -> nanoseconds given an if_tsresol byte (bit7 set = power-of-2) */
+static uint64_t ticks_to_ns(uint64_t ticks, uint8_t resol)
 {
-    batch[*batch_cnt].packet_number = pkt;
+    if (resol & 0x80) {
+        uint8_t shift = resol & 0x7F;
+        return (ticks * 1000000000ULL) >> shift;
+    }
+
+    uint64_t denom = 1;
+    for (uint8_t i = 0; i < resol; i++) {
+        denom *= 10ULL;
+    }
+    if (denom == 0) {
+        return 0xffffffffffffffffULL;
+    }
+    if (denom >= 1000000000ULL) {
+        return ticks / (denom / 1000000000ULL);
+    }
+    return ticks * (1000000000ULL / denom);
+}
+
+static inline void record_packet(int outfd, PacketRecord *batch,
+    size_t *batch_cnt, uint64_t timestamp_ns, uint64_t off)
+{
+    static size_t current_packet_num = 0;
+    printf("Packet %zu: offset=%lu, timestamp_ns=%lu\n", current_packet_num++,
+        off, timestamp_ns);
+
     batch[*batch_cnt].header_offset = off;
+    batch[*batch_cnt].timestamp_ns = timestamp_ns;
     (*batch_cnt)++;
 
     if (*batch_cnt == BATCH_SIZE) {
         ssize_t written =
-            write(out_fd, batch, BATCH_SIZE * sizeof(PacketRecord));
+            write(outfd, batch, BATCH_SIZE * sizeof(PacketRecord));
         (void)written;
         *batch_cnt = 0;
     }
 }
 
-int parse_pcap(const char *filename, const char *output_binary)
+static uint8_t parse_idb_tsresol(const uint8_t *body, size_t body_len)
+{
+    uint8_t resol = 6;
+    size_t off = 0;
+
+    while (off + sizeof(PcapngOptionHeader) <= body_len) {
+        const PcapngOptionHeader *opt =
+            (const PcapngOptionHeader *)(body + off);
+        uint16_t code = opt->option_code;
+        uint16_t len = opt->option_length;
+
+        if (code == OPT_ENDOFOPT && len == 0) {
+            break;
+        }
+
+        size_t padded = (len + 3u) & ~3u;
+        if (off + sizeof(PcapngOptionHeader) + padded > body_len) {
+            break;
+        }
+
+        if (code == IF_TSRESOL_OPT && len >= 1) {
+            resol = body[off + sizeof(PcapngOptionHeader)];
+        }
+
+        off += sizeof(PcapngOptionHeader) + padded;
+    }
+
+    return resol;
+}
+
+// returning a fd to the output binary file for further processing
+int index_pcap(const char *filename, const char *output_binary)
 {
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
         perror("Failed to open input file");
-        return 1;
+        return -1;
     }
 
-    int out_fd = open(output_binary, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out_fd < 0) {
+    int outfd = open(output_binary, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (outfd < 0) {
         perror("Failed to open output binary file");
         close(fd);
-        return 1;
+        return -1;
     }
 
     struct stat sb;
@@ -114,40 +242,47 @@ int parse_pcap(const char *filename, const char *output_binary)
     size_t filesize = sb.st_size;
     if (filesize < sizeof(PcapGlobalHeader)) {
         close(fd);
-        close(out_fd);
-        return 1;
+        close(outfd);
+        return -1;
     }
 
-    uint32_t magic;
-    if (read(fd, &magic, sizeof(magic)) != sizeof(magic)) {
+    uint8_t magic[4];
+    if (read(fd, magic, sizeof(magic)) != sizeof(magic)) {
         close(fd);
-        close(out_fd);
-        return 1;
-    }
-    PcapFormat format = get_format(magic);
-    if (format == UNKNOWN) {
-        fprintf(stderr, "Unknown format magic: 0x%X\n", magic);
-        close(fd);
-        close(out_fd);
-        return 1;
+        close(outfd);
+        return -1;
     }
 
-    size_t file_position = (format != PCAPNG) ? sizeof(PcapGlobalHeader) : 0;
+    EndianType endian = ENDIAN_UNKNOWN;
+    TimestampFormat timestamp_format = TIMESTAMP_UNKNOWN;
+    PcapType type = get_type(magic, &endian, &timestamp_format);
+
+    if (type == UNKNOWN) {
+        fprintf(stderr, "Unknown format magic: 0x%X\n", *(uint32_t *)magic);
+        close(fd);
+        close(outfd);
+        return -1;
+    }
+
+    size_t file_position = type != PCAPNG ? sizeof(PcapGlobalHeader) : 0;
     lseek(fd, file_position, SEEK_SET);
 
-    uint64_t current_packet_num = 1;
+    uint64_t current_packet_num = 0;
     size_t leftover_len = 0;
     uint8_t leftover_buf[MAX_TAIL_BYTES];
 
     PacketRecord batch[BATCH_SIZE];
     size_t batch_count = 0;
 
+    Interface interfaces[128]; // temporarily 128
+    size_t interface_count = 0;
+
     uint8_t *chunk_buf = aligned_alloc(ALIGNMENT, CHUNK_SIZE);
     if (chunk_buf == NULL) {
         fprintf(stderr, "Allocation failed.\n");
         close(fd);
-        close(out_fd);
-        return 1;
+        close(outfd);
+        return -1;
     }
 
     while (file_position < filesize || leftover_len > 0) {
@@ -170,7 +305,7 @@ int parse_pcap(const char *filename, const char *output_binary)
 
         size_t local_offset = 0;
 
-        if (format != PCAPNG) {
+        if (type != PCAPNG) {
             while (local_offset + sizeof(PcapPacketHeader) <= total_buf_len) {
                 const PcapPacketHeader *hdr =
                     (const PcapPacketHeader *)(chunk_buf + local_offset);
@@ -180,10 +315,25 @@ int parse_pcap(const char *filename, const char *output_binary)
                     break;
                 }
 
-                uint64_t global_offset =
-                    (file_position - leftover_len) + local_offset;
-                record_packet(out_fd, batch, &batch_count, current_packet_num++,
-                    global_offset);
+                uint64_t timestamp_ns = 0xffffffffffffffff; // unknown timestamp
+
+                if ((endian == ENDIAN_LITTLE &&
+                        timestamp_format == TIMESTAMP_MICROSECONDS) ||
+                    (endian == ENDIAN_BIG &&
+                        timestamp_format == TIMESTAMP_MICROSECONDS)) {
+                    timestamp_ns = ((uint64_t)hdr->ts_sec * 1000000000ULL) +
+                                   ((uint64_t)hdr->ts_usec * 1000ULL);
+                }
+                else if ((endian == ENDIAN_LITTLE &&
+                             timestamp_format == TIMESTAMP_NANOSECONDS) ||
+                         (endian == ENDIAN_BIG &&
+                             timestamp_format == TIMESTAMP_NANOSECONDS)) {
+                    timestamp_ns = ((uint64_t)hdr->ts_sec * 1000000000ULL) +
+                                   (uint64_t)hdr->ts_usec;
+                }
+
+                record_packet(outfd, batch, &batch_count, timestamp_ns,
+                    (file_position - leftover_len) + local_offset);
 
                 local_offset += pkt_len;
             }
@@ -200,12 +350,75 @@ int parse_pcap(const char *filename, const char *output_binary)
                     break;
                 }
 
-                if (blk->block_type == PCAPNG_EPB ||
-                    blk->block_type == PCAPNG_SPB) {
-                    uint64_t global_offset =
-                        (file_position - leftover_len) + local_offset;
-                    record_packet(out_fd, batch, &batch_count,
-                        current_packet_num++, global_offset);
+                if (blk->block_type == PCAPNG_IDB) {
+                    const PcapngIDB *idb =
+                        (const PcapngIDB *)(chunk_buf + local_offset);
+                    if (interface_count >=
+                        sizeof(interfaces) / sizeof(interfaces[0])) {
+                        printf("Cannot fit more interfaces in the temporary "
+                               "array. "
+                               "Skipping.\n");
+                    }
+                    else {
+                        const uint8_t *options_start =
+                            chunk_buf + local_offset + sizeof(PcapngIDB);
+                        size_t options_len = blk->block_total_length -
+                                             sizeof(PcapngIDB) -
+                                             sizeof(uint32_t);
+                        uint8_t tsresol =
+                            parse_idb_tsresol(options_start, options_len);
+                        printf("Interface %zu: linktype=%u, tsresol=%u\n",
+                            interface_count, idb->linktype, tsresol);
+                        interfaces[interface_count].resol = tsresol;
+                        interfaces[interface_count].linktype = idb->linktype;
+                        interface_count++;
+                    }
+                    local_offset += blk->block_total_length;
+                    continue;
+                }
+
+                if (blk->block_type == PCAPNG_SHB) {
+                    // pcapng files can have multiple shb blocks which can
+                    // change endianness
+                    const PcapngSHB *shb =
+                        (const PcapngSHB *)(chunk_buf + local_offset);
+                    if (memcmp(&shb->byteorder_magic, NG_BYTEORDER_MAGIC_LE,
+                            4) == 0) {
+                        endian = ENDIAN_LITTLE;
+                    }
+                    else if (memcmp(&shb->byteorder_magic,
+                                 NG_BYTEORDER_MAGIC_BE, 4) == 0) {
+                        endian = ENDIAN_BIG;
+                    }
+                    else {
+                        fprintf(stderr,
+                            "Unknown byte order magic in PCAPNG: 0x%X\n",
+                            shb->byteorder_magic);
+                        break;
+                    }
+                    local_offset += blk->block_total_length;
+                    continue;
+                }
+
+                uint64_t timestamp_ns = 0xffffffffffffffff; // unknown timestamp
+
+                if (blk->block_type == PCAPNG_EPB) {
+                    const PcapngEPB *epb =
+                        (const PcapngEPB *)(chunk_buf + local_offset);
+
+                    uint64_t ticks = ((uint64_t)epb->timestamp_high << 32) |
+                                     (uint64_t)epb->timestamp_low;
+
+                    timestamp_ns =
+                        ticks_to_ns(ticks, interfaces[epb->interface_id].resol);
+
+                    record_packet(outfd, batch, &batch_count, timestamp_ns,
+                        (file_position - leftover_len) + local_offset);
+                }
+                else if (blk->block_type == PCAPNG_SPB) {
+                    // interface id is interface_count-1
+                    record_packet(outfd, batch, &batch_count, timestamp_ns,
+                        (file_position - leftover_len) + local_offset);
                 }
 
                 local_offset += blk->block_total_length;
@@ -226,17 +439,17 @@ int parse_pcap(const char *filename, const char *output_binary)
 
     if (batch_count > 0) {
         ssize_t written =
-            write(out_fd, batch, batch_count * sizeof(PacketRecord));
+            write(outfd, batch, batch_count * sizeof(PacketRecord));
         (void)written;
     }
 
     free(chunk_buf);
     close(fd);
-    close(out_fd);
 
-    printf("Parsing complete. Total packets written: %lu\n",
-        current_packet_num - 1);
-    return 0;
+    printf(
+        "Parsing complete. Total packets written: %lu\n", current_packet_num);
+
+    return outfd;
 }
 
 int main(int argc, char **argv)
@@ -248,5 +461,12 @@ int main(int argc, char **argv)
     }
 
     const char *out_path = (argc >= 3) ? argv[2] : "index_output.bin";
-    return parse_pcap(argv[1], out_path);
+    int outfd = index_pcap(argv[1], out_path);
+    if (outfd < 0) {
+        fprintf(stderr, "Failed to index pcap file.\n");
+        return 1;
+    }
+
+    close(outfd);
+    return 0;
 }
